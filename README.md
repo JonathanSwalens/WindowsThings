@@ -9,4 +9,4 @@ This tool uses an _undocumented API_ and has not been thoroughly tested for majo
 - **API:** Utilizes a function from `dwmapi.dll` (ordinal 171) to set SDR content brightness programmatically.
 - **Note:** This is the same adjustment available in Windows Settings under `System > Display > HDR > SDR content brightness`.
 
-[➡️ Go to the SDR-tool folder](./SDR-tool)
+[➡️ SDR-tool]("./SDR content brightness tool")
