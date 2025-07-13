@@ -8,21 +8,27 @@ using System.Reflection;
 using System.Text.Json;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 namespace ScreenBrightnessSetter
 {
+    // Settings for brightness shortcuts and values
     public class ShortcutSettings
     {
         public string IncreaseModifiers { get; set; } = "Control";
         public string IncreaseKey { get; set; } = "F2";
         public string DecreaseModifiers { get; set; } = "Control";
         public string DecreaseKey { get; set; } = "F1";
+        public string CustomModifiers { get; set; } = "Control+Shift";
+        public string CustomKey { get; set; } = "F3";
         public double CurrentBrightness { get; set; } = 3.6;
         public double StepSize { get; set; } = 0.05;
+        public double CustomBrightness { get; set; } = 3.6; // 50% of 1.2 to 6.0 range
     }
 
     class Program
     {
+        // Win32 API imports for brightness control and keyboard hooks
         [DllImport("user32.dll")]
         private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
 
@@ -47,6 +53,9 @@ namespace ScreenBrightnessSetter
         [DllImport("user32.dll")]
         private static extern short GetKeyState(int vKey);
 
+        [DllImport("dwmapi.dll", EntryPoint = "#170")]
+        private static extern int DwmGetSDRToHDRBoost(IntPtr monitor, out double brightness);
+
         private delegate void DwmSetSDRToHDRBoostPtr(IntPtr monitor, double brightness);
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -56,23 +65,42 @@ namespace ScreenBrightnessSetter
         private const int VK_CONTROL = 0x11;
         private const int VK_SHIFT = 0x10;
         private const int VK_MENU = 0x12;
+        private const string MutexName = "ScreenBrightnessSetter_SingleInstance";
 
         public const double MaxBrightness = 6.0;
         public const double MinBrightness = 1.2;
         private static double _brightness = 3.6;
-        public static double Brightness { get => _brightness; private set => _brightness = value; }
+        public static double Brightness
+        {
+            get => _brightness;
+            private set => _brightness = Math.Round(Math.Clamp(value, MinBrightness, MaxBrightness), 2);
+        }
         private static DwmSetSDRToHDRBoostPtr? _setBrightness;
         private static IntPtr _primaryMonitor;
         private static BrightnessController? _controller;
         private static string _settingsFilePath = string.Empty;
         private static ShortcutSettings _settings = new ShortcutSettings();
         private static IntPtr _keyboardHookID = IntPtr.Zero;
-
         private static readonly string[] ValidModifiers = ["Control", "Shift", "Control+Shift", "Shift+Alt", "Control+Shift+Alt"];
+        private static bool _isCustomBrightnessApplied = false;
+        public static bool IsCustomBrightnessApplied
+        {
+            get => _isCustomBrightnessApplied;
+            private set => _isCustomBrightnessApplied = value;
+        }
 
         [STAThread]
         static void Main(string[] args)
         {
+            // Ensure single instance using mutex
+            using var mutex = new Mutex(true, MutexName, out bool createdNew);
+            if (!createdNew)
+            {
+                MessageBox.Show("SDR-Content-Brightness-Tool is already running.", 
+                    "Application Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             try
             {
                 InitializeSettingsPath();
@@ -80,14 +108,14 @@ namespace ScreenBrightnessSetter
 
                 if (!IsRunningAsAdmin())
                 {
-                    MessageBox.Show("This program requires administrative privileges.\nPlease run the program as an administrator.", 
+                    MessageBox.Show("This program requires administrative privileges.\nPlease run as an administrator.", 
                         "Administrator Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
                 if (!InitializeBrightnessController())
                 {
-                    MessageBox.Show("Failed to initialize brightness controller.\nPlease check if your system supports this feature.", 
+                    MessageBox.Show("Failed to initialize brightness controller.\nYour system may not support this feature.", 
                         "Initialization Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
@@ -104,28 +132,27 @@ namespace ScreenBrightnessSetter
             finally
             {
                 if (_keyboardHookID != IntPtr.Zero)
-                {
                     UnhookWindowsHookEx(_keyboardHookID);
-                    System.Diagnostics.Debug.WriteLine("Main: Keyboard hook unhooked");
-                }
                 _controller?.Dispose();
             }
         }
 
+        // Set the path for saving settings
         private static void InitializeSettingsPath()
         {
             try
             {
                 string exePath = Assembly.GetExecutingAssembly().Location;
-                string exeDirectory = Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory;
+                string exeDirectory = Path.GetDirectoryName(exePath) ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 _settingsFilePath = Path.Combine(exeDirectory, "brightness_settings.json");
             }
             catch
             {
-                _settingsFilePath = Path.Combine(Environment.CurrentDirectory, "brightness_settings.json");
+                _settingsFilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "brightness_settings.json");
             }
         }
 
+        // Load settings from JSON file
         private static void LoadSettings()
         {
             try
@@ -137,81 +164,88 @@ namespace ScreenBrightnessSetter
                     if (loadedSettings != null)
                     {
                         _settings = loadedSettings;
-                        Brightness = Math.Clamp(loadedSettings.CurrentBrightness, MinBrightness, MaxBrightness);
-                        if (_settings.StepSize <= 0 || _settings.StepSize > 0.5)
-                        {
-                            _settings.StepSize = 0.05;
-                        }
+                        Brightness = Math.Round(Math.Clamp(loadedSettings.CurrentBrightness, MinBrightness, MaxBrightness), 2);
+                        _settings.StepSize = Math.Clamp(loadedSettings.StepSize, 0.01, 0.5);
+                        _settings.CustomBrightness = Math.Round(Math.Clamp(loadedSettings.CustomBrightness, MinBrightness, MaxBrightness), 2);
                     }
+                }
+                else
+                {
+                    _settings = new ShortcutSettings();
+                    SaveSettings();
                 }
             }
             catch
             {
                 _settings = new ShortcutSettings();
             }
-            System.Diagnostics.Debug.WriteLine($"LoadSettings: Increase={_settings.IncreaseModifiers}+{_settings.IncreaseKey}, Decrease={_settings.DecreaseModifiers}+{_settings.DecreaseKey}, StepSize={_settings.StepSize:P0}, Brightness={Brightness:F1}");
         }
 
+        // Save settings to JSON file
         public static void SaveSettings()
         {
             try
             {
                 _settings.CurrentBrightness = Brightness;
+                _settings.CustomBrightness = Math.Round(_settings.CustomBrightness, 2);
                 string json = JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(_settingsFilePath, json);
-                System.Diagnostics.Debug.WriteLine("SaveSettings: Settings saved");
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"SaveSettings: Error: {ex.Message}");
+                MessageBox.Show($"Error saving settings: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
+        // Initialize brightness controller and keyboard hook
         private static bool InitializeBrightnessController()
         {
             try
             {
                 _primaryMonitor = MonitorFromWindow(IntPtr.Zero, MONITOR_DEFAULTTOPRIMARY);
                 if (_primaryMonitor == IntPtr.Zero)
-                {
-                    System.Diagnostics.Debug.WriteLine("InitializeBrightnessController: Failed to get primary monitor");
                     return false;
-                }
 
                 var dwmapiModule = LoadLibrary("dwmapi.dll");
                 if (dwmapiModule == IntPtr.Zero)
-                {
-                    System.Diagnostics.Debug.WriteLine("InitializeBrightnessController: Failed to load dwmapi.dll");
                     return false;
-                }
 
                 var procAddress = GetProcAddress(dwmapiModule, 171);
                 if (procAddress == IntPtr.Zero)
-                {
-                    System.Diagnostics.Debug.WriteLine("InitializeBrightnessController: Failed to get DwmSetSDRToHDRBoost address");
                     return false;
-                }
 
                 _setBrightness = Marshal.GetDelegateForFunctionPointer<DwmSetSDRToHDRBoostPtr>(procAddress);
+                Brightness = GetCurrentBrightness();
                 _setBrightness(_primaryMonitor, Brightness);
 
                 _keyboardHookID = SetKeyboardHook(HookCallback);
                 if (_keyboardHookID == IntPtr.Zero)
-                {
-                    System.Diagnostics.Debug.WriteLine("InitializeBrightnessController: Failed to set keyboard hook");
                     return false;
-                }
 
-                System.Diagnostics.Debug.WriteLine("InitializeBrightnessController: Initialized successfully");
                 return true;
             }
-            catch (Exception ex)
+            catch
             {
-                System.Diagnostics.Debug.WriteLine($"InitializeBrightnessController: Error: {ex.Message}");
                 return false;
             }
         }
 
+        // Get current brightness from system
+        private static double GetCurrentBrightness()
+        {
+            try
+            {
+                if (DwmGetSDRToHDRBoost(_primaryMonitor, out double currentBrightness) == 0)
+                    return Math.Round(Math.Clamp(currentBrightness, MinBrightness, MaxBrightness), 2);
+                return Brightness;
+            }
+            catch
+            {
+                return Brightness;
+            }
+        }
+
+        // Check if running with admin privileges
         private static bool IsRunningAsAdmin()
         {
             using var identity = WindowsIdentity.GetCurrent();
@@ -219,15 +253,15 @@ namespace ScreenBrightnessSetter
             return principal.IsInRole(WindowsBuiltInRole.Administrator);
         }
 
+        // Set low-level keyboard hook
         private static IntPtr SetKeyboardHook(LowLevelKeyboardProc proc)
         {
             using var curProcess = System.Diagnostics.Process.GetCurrentProcess();
             using var curModule = curProcess.MainModule;
-            IntPtr hook = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule!.ModuleName), 0);
-            System.Diagnostics.Debug.WriteLine($"SetKeyboardHook: {(hook == IntPtr.Zero ? "Failed" : "Success")}");
-            return hook;
+            return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule!.ModuleName), 0);
         }
 
+        // Convert key states to modifier string
         private static string GetModifierString(bool controlPressed, bool shiftPressed, bool altPressed)
         {
             if (controlPressed && shiftPressed && altPressed)
@@ -243,6 +277,7 @@ namespace ScreenBrightnessSetter
             return "";
         }
 
+        // Handle keyboard hook events
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN)
@@ -258,22 +293,18 @@ namespace ScreenBrightnessSetter
 
                 if (!string.IsNullOrEmpty(modifier) && IsValidKey(key))
                 {
-                    System.Diagnostics.Debug.WriteLine($"HookCallback: Detected {modifier}+{key}");
                     if (modifier == settings.IncreaseModifiers && key == settings.IncreaseKey)
-                    {
-                        System.Diagnostics.Debug.WriteLine("HookCallback: Matched Increase hotkey");
                         IncreaseBrightness();
-                    }
                     else if (modifier == settings.DecreaseModifiers && key == settings.DecreaseKey)
-                    {
-                        System.Diagnostics.Debug.WriteLine("HookCallback: Matched Decrease hotkey");
                         DecreaseBrightness();
-                    }
+                    else if (modifier == settings.CustomModifiers && key == settings.CustomKey)
+                        SetCustomBrightness();
                 }
             }
             return CallNextHookEx(_keyboardHookID, nCode, wParam, lParam);
         }
 
+        // Validate keyboard key
         private static bool IsValidKey(string key)
         {
             if (key.StartsWith("F") && int.TryParse(key.Substring(1), out int fNum) && fNum >= 1 && fNum <= 24)
@@ -281,68 +312,103 @@ namespace ScreenBrightnessSetter
             return new[] { "Up", "Down", "PageUp", "PageDown", "Home", "End", "OemPlus", "OemMinus" }.Contains(key);
         }
 
+        // Calculate percentage from brightness value
+        public static double GetPercentage(double brightness)
+        {
+            return (brightness - MinBrightness) / (MaxBrightness - MinBrightness) * 100;
+        }
+
+        // Increase brightness by step size
         public static void IncreaseBrightness()
         {
-            double oldBrightness = Brightness;
-            double stepPercentage = Math.Round(_settings.StepSize * 100);
-            double currentPercentage = ((Brightness - MinBrightness) / (MaxBrightness - MinBrightness)) * 100;
-            double newPercentage = Math.Min(100, currentPercentage + stepPercentage);
-            Brightness = MinBrightness + (newPercentage / 100) * (MaxBrightness - MinBrightness);
-            System.Diagnostics.Debug.WriteLine($"IncreaseBrightness: Old={oldBrightness:F1} ({currentPercentage:F0}%), Step={stepPercentage:F0}%, New={Brightness:F1} ({newPercentage:F0}%)");
-            UpdateBrightness(oldBrightness);
-        }
-
-        public static void DecreaseBrightness()
-        {
-            double oldBrightness = Brightness;
-            double stepPercentage = Math.Round(_settings.StepSize * 100);
-            double currentPercentage = ((Brightness - MinBrightness) / (MaxBrightness - MinBrightness)) * 100;
-            double newPercentage = Math.Max(0, currentPercentage - stepPercentage);
-            Brightness = MinBrightness + (newPercentage / 100) * (MaxBrightness - MinBrightness);
-            System.Diagnostics.Debug.WriteLine($"DecreaseBrightness: Old={oldBrightness:F1} ({currentPercentage:F0}%), Step={stepPercentage:F0}%, New={Brightness:F1} ({newPercentage:F0}%)");
-            UpdateBrightness(oldBrightness);
-        }
-
-        private static void UpdateBrightness(double oldBrightness)
-        {
-            if (Math.Abs(Brightness - oldBrightness) > 0.001)
+            try
             {
-                try
-                {
-                    Brightness = Math.Clamp(Brightness, MinBrightness, MaxBrightness);
-                    System.Diagnostics.Debug.WriteLine($"UpdateBrightness: Clamped brightness={Brightness:F1}");
-                    if (_setBrightness != null)
-                    {
-                        _setBrightness(_primaryMonitor, Brightness);
-                        System.Diagnostics.Debug.WriteLine($"UpdateBrightness: Applied brightness={Brightness:F1}");
-                        _controller?.UpdateBrightnessDisplay(Brightness);
-                        SaveSettings();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"UpdateBrightness: Error: {ex.Message}");
-                }
+                double currentBrightness = GetCurrentBrightness();
+                double stepPercentage = _settings.StepSize * 100;
+                double currentPercentage = GetPercentage(currentBrightness);
+                double newPercentage = Math.Min(100, Math.Ceiling(currentPercentage / stepPercentage) * stepPercentage + stepPercentage);
+                Brightness = Math.Round(MinBrightness + (newPercentage / 100) * (MaxBrightness - MinBrightness), 2);
+                IsCustomBrightnessApplied = false;
+                UpdateBrightness(currentBrightness);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error increasing brightness: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
-        public static bool ValidateHotkey(string modifiers, string key)
+        // Decrease brightness by step size
+        public static void DecreaseBrightness()
         {
-            bool isValid = ValidModifiers.Contains(modifiers) && IsValidKey(key);
-            System.Diagnostics.Debug.WriteLine($"ValidateHotkey: Modifiers={modifiers}, Key={key}, Valid={isValid}");
-            return isValid;
+            try
+            {
+                double currentBrightness = GetCurrentBrightness();
+                double stepPercentage = _settings.StepSize * 100;
+                double currentPercentage = GetPercentage(currentBrightness);
+                double newPercentage = Math.Max(0, Math.Floor(currentPercentage / stepPercentage) * stepPercentage - stepPercentage);
+                Brightness = Math.Round(MinBrightness + (newPercentage / 100) * (MaxBrightness - MinBrightness), 2);
+                IsCustomBrightnessApplied = false;
+                UpdateBrightness(currentBrightness);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error decreasing brightness: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
+        // Set custom brightness value
+        public static void SetCustomBrightness()
+        {
+            try
+            {
+                double currentBrightness = GetCurrentBrightness();
+                Brightness = Math.Round(Math.Clamp(_settings.CustomBrightness, MinBrightness, MaxBrightness), 2);
+                IsCustomBrightnessApplied = true;
+                UpdateBrightness(currentBrightness);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error setting custom brightness: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Update system brightness and UI
+        private static void UpdateBrightness(double oldBrightness)
+        {
+            if (Math.Abs(Brightness - oldBrightness) < 0.001)
+                return;
+
+            try
+            {
+                _setBrightness?.Invoke(_primaryMonitor, Brightness);
+                _controller?.UpdateBrightnessDisplay(Brightness, IsCustomBrightnessApplied);
+                SaveSettings();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error updating brightness: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Validate hotkey combination
+        public static bool ValidateHotkey(string modifiers, string key)
+        {
+            return ValidModifiers.Contains(modifiers) && IsValidKey(key);
+        }
+
+        // Get current settings
         public static ShortcutSettings GetSettings()
         {
             return _settings;
         }
 
+        // Update settings with new values
         public static void UpdateSettings(ShortcutSettings newSettings)
         {
             _settings = newSettings;
-            Brightness = Math.Clamp(newSettings.CurrentBrightness, MinBrightness, MaxBrightness);
-            System.Diagnostics.Debug.WriteLine($"UpdateSettings: Increase={newSettings.IncreaseModifiers}+{newSettings.IncreaseKey}, Decrease={newSettings.DecreaseModifiers}+{newSettings.DecreaseKey}, StepSize={newSettings.StepSize:P0}, Brightness={Brightness:F1}");
+            Brightness = Math.Round(Math.Clamp(newSettings.CurrentBrightness, MinBrightness, MaxBrightness), 2);
+            _settings.StepSize = Math.Clamp(newSettings.StepSize, 0.01, 0.5);
+            _settings.CustomBrightness = Math.Round(Math.Clamp(newSettings.CustomBrightness, MinBrightness, MaxBrightness), 2);
             SaveSettings();
         }
     }
@@ -369,9 +435,10 @@ namespace ScreenBrightnessSetter
             _exitMenuItem = new ToolStripMenuItem("Exit");
 
             CreateSystemTrayIcon();
-            UpdateBrightnessDisplay(Program.Brightness);
+            UpdateBrightnessDisplay(Program.Brightness, false);
         }
 
+        // Create system tray icon and context menu
         private void CreateSystemTrayIcon()
         {
             _settingsMenuItem.Click += ShowSettings;
@@ -388,33 +455,50 @@ namespace ScreenBrightnessSetter
             });
 
             _notifyIcon.Icon = CreateBrightnessIcon(Program.Brightness);
-            _notifyIcon.Text = GetTooltipText(Program.Brightness);
+            _notifyIcon.Text = GetTooltipText(Program.Brightness, false);
             _notifyIcon.ContextMenuStrip = _contextMenu;
             _notifyIcon.Visible = true;
             
             _notifyIcon.DoubleClick += (sender, e) => 
             {
-                double percentage = ((Program.Brightness - Program.MinBrightness) / (Program.MaxBrightness - Program.MinBrightness)) * 100;
                 var settings = Program.GetSettings();
-                MessageBox.Show($"Current Brightness: {percentage:F0}%\n\nShortcuts:\n• Increase: {settings.IncreaseModifiers}+{settings.IncreaseKey}\n• Decrease: {settings.DecreaseModifiers}+{settings.DecreaseKey}\n\nSettings saved to: brightness_settings.json", 
+                double percentage = Program.GetPercentage(Program.Brightness);
+                double displayPercentage = Program.IsCustomBrightnessApplied 
+                    ? Math.Round(percentage)
+                    : settings.StepSize > 0 
+                        ? Math.Round(percentage / (settings.StepSize * 100)) * (settings.StepSize * 100)
+                        : Math.Round(percentage);
+                MessageBox.Show($"Current Brightness: {displayPercentage:F0}%\n\nShortcuts:\n• Increase: {settings.IncreaseModifiers}+{settings.IncreaseKey}\n• Decrease: {settings.DecreaseModifiers}+{settings.DecreaseKey}\n• Custom ({settings.CustomBrightness:F2}x): {settings.CustomModifiers}+{settings.CustomKey}\n\nSettings saved to: brightness_settings.json", 
                     "SDR Content Brightness", MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
         }
 
-        private string GetTooltipText(double brightness)
+        // Get rounded percentage for display
+        private double GetRoundedPercentage(double brightness, bool isCustomBrightness)
         {
-            double percentage = ((brightness - Program.MinBrightness) / (Program.MaxBrightness - Program.MinBrightness)) * 100;
-            return $"Brightness: {percentage:F0}%";
+            double percentage = Program.GetPercentage(brightness);
+            if (isCustomBrightness)
+                return Math.Round(percentage);
+            double stepSize = Program.GetSettings().StepSize * 100;
+            return stepSize > 0 ? Math.Round(percentage / stepSize) * stepSize : Math.Round(percentage);
         }
 
-        public void UpdateBrightnessDisplay(double brightness)
+        // Get tooltip text for system tray
+        private string GetTooltipText(double brightness, bool isCustomBrightness)
+        {
+            double roundedPercentage = GetRoundedPercentage(brightness, isCustomBrightness);
+            return $"Brightness: {roundedPercentage:F0}%";
+        }
+
+        // Update brightness display in system tray
+        public void UpdateBrightnessDisplay(double brightness, bool isCustomBrightness)
         {
             if (_disposed) return;
 
             try
             {
-                double percentage = ((brightness - Program.MinBrightness) / (Program.MaxBrightness - Program.MinBrightness)) * 100;
-                _brightnessMenuItem.Text = $"Brightness: {percentage:F0}%";
+                double roundedPercentage = GetRoundedPercentage(brightness, isCustomBrightness);
+                _brightnessMenuItem.Text = $"Brightness: {roundedPercentage:F0}%";
                 
                 var newIcon = CreateBrightnessIcon(brightness);
                 if (newIcon != null)
@@ -423,13 +507,15 @@ namespace ScreenBrightnessSetter
                     _notifyIcon.Icon = newIcon;
                 }
                 
-                _notifyIcon.Text = GetTooltipText(brightness);
+                _notifyIcon.Text = GetTooltipText(brightness, isCustomBrightness);
             }
             catch
             {
+                // Silently handle icon update errors
             }
         }
 
+        // Create system tray icon with brightness percentage
         private Icon CreateBrightnessIcon(double brightness)
         {
             try
@@ -440,10 +526,10 @@ namespace ScreenBrightnessSetter
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 
-                double percentage = ((brightness - Program.MinBrightness) / (Program.MaxBrightness - Program.MinBrightness)) * 100;
-                Color textColor = percentage > 70 ? Color.White : percentage > 30 ? Color.LightGray : Color.LightBlue;
+                double roundedPercentage = GetRoundedPercentage(brightness, Program.IsCustomBrightnessApplied);
+                Color textColor = roundedPercentage > 70 ? Color.White : roundedPercentage > 30 ? Color.LightGray : Color.LightBlue;
                 
-                string text = percentage >= 100 ? "100" : percentage >= 10 ? $"{(int)percentage}" : $"{(int)percentage}";
+                string text = roundedPercentage >= 100 ? "100" : roundedPercentage >= 10 ? $"{(int)roundedPercentage}" : $"{(int)roundedPercentage}";
                 
                 using var font = new Font("Consolas", 9, FontStyle.Bold);
                 using var brush = new SolidBrush(textColor);
@@ -457,9 +543,7 @@ namespace ScreenBrightnessSetter
                     for (int offsetY = -1; offsetY <= 1; offsetY++)
                     {
                         if (offsetX != 0 || offsetY != 0)
-                        {
                             g.DrawString(text, font, blackBrush, x + offsetX, y + offsetY);
-                        }
                     }
                 }
                 
@@ -473,24 +557,34 @@ namespace ScreenBrightnessSetter
             }
         }
 
+        // Show settings form
         private void ShowSettings(object? sender, EventArgs e)
         {
             new SettingsForm().ShowDialog();
         }
 
+        // Show about dialog
         private void ShowAbout(object? sender, EventArgs e)
         {
             var settings = Program.GetSettings();
-            MessageBox.Show($"SDR Content Brightness\n\nAdjusts SDR content brightness using keyboard shortcuts.\n\nShortcuts:\n• Increase: {settings.IncreaseModifiers}+{settings.IncreaseKey}\n• Decrease: {settings.DecreaseModifiers}+{settings.DecreaseKey}\n\nSettings saved to: brightness_settings.json", 
+            double percentage = Program.GetPercentage(Program.Brightness);
+            double displayPercentage = Program.IsCustomBrightnessApplied 
+                ? Math.Round(percentage)
+                : settings.StepSize > 0 
+                    ? Math.Round(percentage / (settings.StepSize * 100)) * (settings.StepSize * 100)
+                    : Math.Round(percentage);
+            MessageBox.Show($"SDR Content Brightness\nVersion 1.0.0\n\nAdjusts SDR content brightness using keyboard shortcuts.\n\nCurrent Brightness: {displayPercentage:F0}%\n\nShortcuts:\n• Increase: {settings.IncreaseModifiers}+{settings.IncreaseKey}\n• Decrease: {settings.DecreaseModifiers}+{settings.DecreaseKey}\n• Custom ({settings.CustomBrightness:F2}x): {settings.CustomModifiers}+{settings.CustomKey}\n\nSettings saved to: brightness_settings.json\n\nThanks to @A Hoj for contributions", 
                 "About SDR Content Brightness", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
+        // Exit application
         private void ExitApplication(object? sender, EventArgs e)
         {
             Program.SaveSettings();
             Application.Exit();
         }
 
+        // Dispose resources
         public void Dispose()
         {
             if (!_disposed)
@@ -508,7 +602,10 @@ namespace ScreenBrightnessSetter
         private readonly ComboBox _increaseKeyComboBox;
         private readonly ComboBox _decreaseModifiersComboBox;
         private readonly ComboBox _decreaseKeyComboBox;
+        private readonly ComboBox _customModifiersComboBox;
+        private readonly ComboBox _customKeyComboBox;
         private readonly NumericUpDown _stepSizeNumericUpDown;
+        private readonly NumericUpDown _customBrightnessNumericUpDown;
         private readonly Button _okButton;
         private readonly Button _cancelButton;
         private readonly Button _defaultsButton;
@@ -519,7 +616,10 @@ namespace ScreenBrightnessSetter
             _increaseKeyComboBox = new ComboBox();
             _decreaseModifiersComboBox = new ComboBox();
             _decreaseKeyComboBox = new ComboBox();
+            _customModifiersComboBox = new ComboBox();
+            _customKeyComboBox = new ComboBox();
             _stepSizeNumericUpDown = new NumericUpDown();
+            _customBrightnessNumericUpDown = new NumericUpDown();
             _okButton = new Button();
             _cancelButton = new Button();
             _defaultsButton = new Button();
@@ -528,10 +628,11 @@ namespace ScreenBrightnessSetter
             LoadCurrentSettings();
         }
 
+        // Initialize form controls
         private void InitializeComponent()
         {
             Text = "SDR Content Brightness Settings";
-            Size = new Size(450, 350);
+            Size = new Size(450, 400);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -571,14 +672,31 @@ namespace ScreenBrightnessSetter
             _decreaseKeyComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
             _decreaseKeyComboBox.Items.AddRange(GetValidKeys());
 
-            var stepSizeLabel = new Label
+            var customLabel = new Label
             {
-                Text = "Step Size (%):",
+                Text = "Custom Brightness:",
                 Location = new Point(20, 100),
                 Size = new Size(120, 23)
             };
 
-            _stepSizeNumericUpDown.Location = new Point(150, 100);
+            _customModifiersComboBox.Location = new Point(150, 100);
+            _customModifiersComboBox.Size = new Size(120, 23);
+            _customModifiersComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            _customModifiersComboBox.Items.AddRange(new[] { "Control", "Shift", "Control+Shift", "Shift+Alt", "Control+Shift+Alt" });
+
+            _customKeyComboBox.Location = new Point(280, 100);
+            _customKeyComboBox.Size = new Size(80, 23);
+            _customKeyComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            _customKeyComboBox.Items.AddRange(GetValidKeys());
+
+            var stepSizeLabel = new Label
+            {
+                Text = "Step Size (%):",
+                Location = new Point(20, 140),
+                Size = new Size(120, 23)
+            };
+
+            _stepSizeNumericUpDown.Location = new Point(150, 140);
             _stepSizeNumericUpDown.Size = new Size(80, 23);
             _stepSizeNumericUpDown.Minimum = 1;
             _stepSizeNumericUpDown.Maximum = 50;
@@ -586,27 +704,42 @@ namespace ScreenBrightnessSetter
             _stepSizeNumericUpDown.DecimalPlaces = 0;
             _stepSizeNumericUpDown.Value = 5;
 
+            var customBrightnessLabel = new Label
+            {
+                Text = "Custom Brightness (%):",
+                Location = new Point(20, 180),
+                Size = new Size(120, 23)
+            };
+
+            _customBrightnessNumericUpDown.Location = new Point(150, 180);
+            _customBrightnessNumericUpDown.Size = new Size(80, 23);
+            _customBrightnessNumericUpDown.Minimum = 0;
+            _customBrightnessNumericUpDown.Maximum = 100;
+            _customBrightnessNumericUpDown.Increment = 1;
+            _customBrightnessNumericUpDown.DecimalPlaces = 0;
+            _customBrightnessNumericUpDown.Value = 50;
+
             var helpLabel = new Label
             {
-                Text = "Select a modifier (Control, Shift, Control+Shift, Shift+Alt, Control+Shift+Alt) and a key (F1-F24, Up, Down, PageUp, PageDown, Home, End, +, -).\nSet step size (1-50%) for brightness changes.\nHotkeys must be unique.",
-                Location = new Point(20, 140),
+                Text = "Select a modifier (Control, Shift, Control+Shift, Shift+Alt, Control+Shift+Alt) and a key (F1-F24, Up, Down, PageUp, PageDown, Home, End, +, -).\nSet step size (1-50%) for brightness changes.\nSet custom brightness (0-100%) for instant application.\nHotkeys must be unique.",
+                Location = new Point(20, 220),
                 Size = new Size(400, 80),
                 ForeColor = Color.Gray
             };
 
             _defaultsButton.Text = "Defaults";
-            _defaultsButton.Location = new Point(20, 240);
+            _defaultsButton.Location = new Point(20, 310);
             _defaultsButton.Size = new Size(80, 30);
             _defaultsButton.Click += DefaultsButton_Click;
 
             _okButton.Text = "OK";
-            _okButton.Location = new Point(260, 240);
+            _okButton.Location = new Point(260, 310);
             _okButton.Size = new Size(80, 30);
             _okButton.DialogResult = DialogResult.OK;
             _okButton.Click += OkButton_Click;
 
             _cancelButton.Text = "Cancel";
-            _cancelButton.Location = new Point(345, 240);
+            _cancelButton.Location = new Point(345, 310);
             _cancelButton.Size = new Size(80, 30);
             _cancelButton.DialogResult = DialogResult.Cancel;
 
@@ -614,7 +747,9 @@ namespace ScreenBrightnessSetter
             {
                 increaseLabel, _increaseModifiersComboBox, _increaseKeyComboBox,
                 decreaseLabel, _decreaseModifiersComboBox, _decreaseKeyComboBox,
+                customLabel, _customModifiersComboBox, _customKeyComboBox,
                 stepSizeLabel, _stepSizeNumericUpDown,
+                customBrightnessLabel, _customBrightnessNumericUpDown,
                 helpLabel, _defaultsButton, _okButton, _cancelButton
             });
 
@@ -622,6 +757,7 @@ namespace ScreenBrightnessSetter
             CancelButton = _cancelButton;
         }
 
+        // Get valid keys for hotkey selection
         private static string[] GetValidKeys()
         {
             var functionKeys = Enumerable.Range(1, 24).Select(i => $"F{i}").ToList();
@@ -629,6 +765,7 @@ namespace ScreenBrightnessSetter
             return functionKeys.Concat(otherKeys).ToArray();
         }
 
+        // Load current settings into form
         private void LoadCurrentSettings()
         {
             var settings = Program.GetSettings();
@@ -636,7 +773,10 @@ namespace ScreenBrightnessSetter
             _increaseKeyComboBox.SelectedItem = settings.IncreaseKey;
             _decreaseModifiersComboBox.SelectedItem = settings.DecreaseModifiers;
             _decreaseKeyComboBox.SelectedItem = settings.DecreaseKey;
+            _customModifiersComboBox.SelectedItem = settings.CustomModifiers;
+            _customKeyComboBox.SelectedItem = settings.CustomKey;
             _stepSizeNumericUpDown.Value = (decimal)(settings.StepSize * 100);
+            _customBrightnessNumericUpDown.Value = (decimal)(Program.GetPercentage(settings.CustomBrightness));
 
             if (_increaseModifiersComboBox.SelectedItem == null || _increaseKeyComboBox.SelectedItem == null)
             {
@@ -648,21 +788,35 @@ namespace ScreenBrightnessSetter
                 _decreaseModifiersComboBox.SelectedItem = "Control";
                 _decreaseKeyComboBox.SelectedItem = "F1";
             }
+            if (_customModifiersComboBox.SelectedItem == null || _customKeyComboBox.SelectedItem == null)
+            {
+                _customModifiersComboBox.SelectedItem = "Control+Shift";
+                _customKeyComboBox.SelectedItem = "F3";
+            }
             if (_stepSizeNumericUpDown.Value <= 0 || _stepSizeNumericUpDown.Value > 50)
             {
                 _stepSizeNumericUpDown.Value = 5;
             }
+            if (_customBrightnessNumericUpDown.Value < 0 || _customBrightnessNumericUpDown.Value > 100)
+            {
+                _customBrightnessNumericUpDown.Value = 50;
+            }
         }
 
+        // Reset to default settings
         private void DefaultsButton_Click(object? sender, EventArgs e)
         {
             _increaseModifiersComboBox.SelectedItem = "Control";
             _increaseKeyComboBox.SelectedItem = "F2";
             _decreaseModifiersComboBox.SelectedItem = "Control";
             _decreaseKeyComboBox.SelectedItem = "F1";
+            _customModifiersComboBox.SelectedItem = "Control+Shift";
+            _customKeyComboBox.SelectedItem = "F3";
             _stepSizeNumericUpDown.Value = 5;
+            _customBrightnessNumericUpDown.Value = 50;
         }
 
+        // Save settings and validate
         private void OkButton_Click(object? sender, EventArgs e)
         {
             try
@@ -671,9 +825,11 @@ namespace ScreenBrightnessSetter
                 string increaseKey = _increaseKeyComboBox.SelectedItem?.ToString() ?? "F2";
                 string decreaseModifiers = _decreaseModifiersComboBox.SelectedItem?.ToString() ?? "Control";
                 string decreaseKey = _decreaseKeyComboBox.SelectedItem?.ToString() ?? "F1";
+                string customModifiers = _customModifiersComboBox.SelectedItem?.ToString() ?? "Control+Shift";
+                string customKey = _customKeyComboBox.SelectedItem?.ToString() ?? "F3";
                 double stepSize = (double)_stepSizeNumericUpDown.Value / 100;
-
-                System.Diagnostics.Debug.WriteLine($"OkButton_Click: Increase={increaseModifiers}+{increaseKey}, Decrease={decreaseModifiers}+{decreaseKey}, StepSize={stepSize:P0}");
+                double customBrightnessPercentage = (double)_customBrightnessNumericUpDown.Value;
+                double customBrightness = Math.Round(Program.MinBrightness + (customBrightnessPercentage / 100) * (Program.MaxBrightness - Program.MinBrightness), 2);
 
                 if (!Program.ValidateHotkey(increaseModifiers, increaseKey))
                 {
@@ -689,9 +845,23 @@ namespace ScreenBrightnessSetter
                     return;
                 }
 
-                if (increaseModifiers == decreaseModifiers && increaseKey == decreaseKey)
+                if (!Program.ValidateHotkey(customModifiers, customKey))
                 {
-                    MessageBox.Show("Increase and Decrease hotkeys cannot be the same.", 
+                    MessageBox.Show($"Invalid Custom hotkey: {customModifiers}+{customKey}.", 
+                        "Invalid Hotkey", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                var hotkeys = new[]
+                {
+                    (increaseModifiers, increaseKey),
+                    (decreaseModifiers, decreaseKey),
+                    (customModifiers, customKey)
+                };
+
+                if (hotkeys.GroupBy(h => (h.Item1, h.Item2)).Any(g => g.Count() > 1))
+                {
+                    MessageBox.Show("All hotkeys must be unique.", 
                         "Invalid Hotkey", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
@@ -703,14 +873,24 @@ namespace ScreenBrightnessSetter
                     return;
                 }
 
+                if (customBrightnessPercentage < 0 || customBrightnessPercentage > 100)
+                {
+                    MessageBox.Show("Custom brightness must be between 0% and 100%.", 
+                        "Invalid Custom Brightness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
                 var newSettings = new ShortcutSettings
                 {
                     IncreaseModifiers = increaseModifiers,
                     IncreaseKey = increaseKey,
                     DecreaseModifiers = decreaseModifiers,
                     DecreaseKey = decreaseKey,
+                    CustomModifiers = customModifiers,
+                    CustomKey = customKey,
                     CurrentBrightness = Program.Brightness,
-                    StepSize = stepSize
+                    StepSize = stepSize,
+                    CustomBrightness = customBrightness
                 };
 
                 Program.UpdateSettings(newSettings);
@@ -719,7 +899,6 @@ namespace ScreenBrightnessSetter
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"OkButton_Click: Error: {ex.Message}");
                 MessageBox.Show($"Error saving settings: {ex.Message}", 
                     "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
